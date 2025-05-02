@@ -1,8 +1,9 @@
+use core::time;
 use std::{
-    any::Any,
     ffi::{CStr, CString},
     fs,
     ops::Deref,
+    thread,
 };
 
 use winit::{
@@ -10,7 +11,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::{Window, WindowButtons, WindowId},
+    window::{Window, WindowId},
 };
 
 use ash::{
@@ -24,6 +25,8 @@ use ash::{
         SwapchainKHR,
     },
 };
+
+const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 
 struct Renderer {
     instance: Instance, // the actual vulkan instance
@@ -43,10 +46,11 @@ struct Renderer {
     graphics_pipeline: Pipeline,
     framebuffers: Vec<Framebuffer>,
     command_pool: CommandPool,
-    command_buffer: CommandBuffer,
-    image_available_semaphore: vk::Semaphore,
-    render_finished_semaphore: vk::Semaphore,
-    in_flight_fence: vk::Fence,
+    command_buffers: Vec<CommandBuffer>,
+    image_available_semaphores: Vec<Semaphore>,
+    render_finished_semaphores: Vec<Semaphore>,
+    in_flight_fences: Vec<Fence>,
+    current_frame: u32,
 }
 
 impl Renderer {
@@ -58,22 +62,23 @@ impl Renderer {
 
     fn cleanup(&mut self) {}
 
-    fn create_instance(entry: &Entry) -> Instance {
+    fn create_instance(entry: &Entry, window: &Window) -> Instance {
         let app_name = c"Ashes to ashes";
 
         let appInfo = vk::ApplicationInfo::default()
             .application_name(app_name)
             .application_version(0)
             .engine_name(app_name)
-            .engine_version(0)
-            .api_version(vk::API_VERSION_1_2);
+            .engine_version(0);
 
-        let extension_names = vec![
-            vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
-            vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME.as_ptr(),
-            vk::KHR_SURFACE_NAME.as_ptr(),
-            vk::EXT_METAL_SURFACE_NAME.as_ptr(),
-        ];
+        let extension_names =
+            ash_window::enumerate_required_extensions(window.display_handle().unwrap().as_raw())
+                .unwrap();
+        let mut extension_names = extension_names.to_vec();
+
+        extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+        // Enabling this extension is a requirement when using `VK_KHR_portability_subset`
+        extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
 
         let props = unsafe { entry.enumerate_instance_layer_properties() }.unwrap();
 
@@ -501,23 +506,20 @@ impl Renderer {
         unsafe { device.create_command_pool(&pool_info, None) }.unwrap()
     }
 
-    fn create_command_buffer(device: &Device, command_pool: &CommandPool) -> CommandBuffer {
+    fn create_command_buffers(device: &Device, command_pool: &CommandPool) -> Vec<CommandBuffer> {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(*command_pool)
             // you can call secondary command buffers from primary ones
             // almost like an abstraction over procedures
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT);
 
-        let command_buffer = *(unsafe { device.allocate_command_buffers(&alloc_info) }
-            .unwrap()
-            .first()
-            .unwrap());
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap();
 
-        command_buffer
+        command_buffers
     }
 
-    fn create_sync_objects(device: &Device) -> (Semaphore, Semaphore, Fence) {
+    fn create_sync_objects(device: &Device) -> (Vec<Semaphore>, Vec<Semaphore>, Vec<Fence>) {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
         // Create a CPU fence, and make sure to mark it as signaled
         // That way in our draw function, we can avoid having to
@@ -525,24 +527,28 @@ impl Renderer {
         // first call
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
 
-        let image_available_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap();
+        let mut image_available_semaphores: Vec<Semaphore> = Vec::new();
+        let mut render_finished_semaphores: Vec<Semaphore> = Vec::new();
+        let mut in_flight_fences: Vec<Fence> = Vec::new();
 
-        let render_finished_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap();
-
-        let in_flight_fence = unsafe { device.create_fence(&fence_info, None) }.unwrap();
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            image_available_semaphores
+                .push(unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap());
+            render_finished_semaphores
+                .push(unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap());
+            in_flight_fences.push(unsafe { device.create_fence(&fence_info, None) }.unwrap());
+        }
 
         (
-            image_available_semaphore,
-            render_finished_semaphore,
-            in_flight_fence,
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
         )
     }
 
     fn new(window: &Window) -> Self {
         let entry = unsafe { Entry::load() }.expect("failed to create instance!");
-        let instance = Self::create_instance(&entry);
+        let instance = Self::create_instance(&entry, window);
         let physical_device = Self::pick_physical_device(&instance);
         let (device, queue, queue_family_index) =
             Self::create_logical_device(&instance, &physical_device);
@@ -563,9 +569,9 @@ impl Renderer {
         );
 
         let command_pool = Self::create_command_pool(&device, queue_family_index);
-        let command_buffer = Self::create_command_buffer(&device, &command_pool);
+        let command_buffers = Self::create_command_buffers(&device, &command_pool);
 
-        let (image_available_semaphore, render_finished_semaphore, in_flight_fence) =
+        let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
             Self::create_sync_objects(&device);
 
         Self {
@@ -586,21 +592,22 @@ impl Renderer {
             graphics_pipeline,
             framebuffers,
             command_pool,
-            command_buffer,
-            image_available_semaphore,
-            render_finished_semaphore,
-            in_flight_fence,
+            command_buffers,
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+            current_frame: 0
         }
     }
 
-    fn record_command_buffer(&self, image_index: usize) {
+    fn record_command_buffer(&self, command_buffer: CommandBuffer, image_index: usize) {
         let begin_info = vk::CommandBufferBeginInfo::default();
 
         // Start recording commands
 
         unsafe {
             self.device
-                .begin_command_buffer(self.command_buffer, &begin_info)
+                .begin_command_buffer(command_buffer, &begin_info)
         }
         .unwrap();
 
@@ -625,7 +632,7 @@ impl Renderer {
 
         unsafe {
             self.device.cmd_begin_render_pass(
-                self.command_buffer,
+                command_buffer,
                 &render_pass_info,
                 vk::SubpassContents::INLINE, // no secondary command buffers will be used
             )
@@ -648,7 +655,7 @@ impl Renderer {
 
         unsafe {
             self.device
-                .cmd_set_viewport(self.command_buffer, 0, viewports.as_slice())
+                .cmd_set_viewport(command_buffer, 0, viewports.as_slice())
         };
 
         let scissor = vk::Rect2D::default()
@@ -659,14 +666,14 @@ impl Renderer {
 
         unsafe {
             self.device
-                .cmd_set_scissor(self.command_buffer, 0, scissors.as_slice())
+                .cmd_set_scissor(command_buffer, 0, scissors.as_slice())
         };
 
         // Need to bind the pipeline
 
         unsafe {
             self.device.cmd_bind_pipeline(
-                self.command_buffer,
+                command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             )
@@ -674,18 +681,18 @@ impl Renderer {
 
         // Now we can issue the draw command for our triangles
 
-        unsafe { self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0) };
+        unsafe { self.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
         // Now we can end the render pass
 
-        unsafe { self.device.cmd_end_render_pass(self.command_buffer) };
+        unsafe { self.device.cmd_end_render_pass(command_buffer) };
 
-        unsafe { self.device.end_command_buffer(self.command_buffer) };
+        unsafe { self.device.end_command_buffer(command_buffer) };
     }
 
-    fn draw_frame(&self) {
+    fn draw_frame(&mut self) {
         // First thing we do is wait for our GPU to finish recieving our command buffer
-        let fences = vec![self.in_flight_fence];
+        let fences = vec![self.in_flight_fences[self.current_frame as usize]];
         unsafe {
             self.device
                 .wait_for_fences(fences.as_slice(), true, u64::MAX)
@@ -699,7 +706,7 @@ impl Renderer {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
-                self.image_available_semaphore,
+                self.image_available_semaphores[self.current_frame as usize],
                 Fence::null(),
             )
         }
@@ -708,21 +715,23 @@ impl Renderer {
         // Make sure our command buffer is reset
 
         unsafe {
-            self.device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+            self.device.reset_command_buffer(
+                self.command_buffers[self.current_frame as usize],
+                vk::CommandBufferResetFlags::empty(),
+            )
         }
         .unwrap();
 
         // Stream commands into our buffer
 
-        self.record_command_buffer(image_idx as usize);
+        self.record_command_buffer(self.command_buffers[self.current_frame as usize], image_idx as usize);
 
         // Now we submit the command buffer
 
-        let wait_semaphores = vec![self.image_available_semaphore];
+        let wait_semaphores = vec![self.image_available_semaphores[self.current_frame as usize]];
         let wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let command_buffers = vec![self.command_buffer];
-        let signal_semaphores = vec![self.render_finished_semaphore];
+        let command_buffers = vec![self.command_buffers[self.current_frame as usize]];
+        let signal_semaphores = vec![self.render_finished_semaphores[self.current_frame as usize]];
 
         let submit_info = vk::SubmitInfo::default()
             .wait_semaphores(wait_semaphores.as_slice())
@@ -734,7 +743,7 @@ impl Renderer {
 
         unsafe {
             self.device
-                .queue_submit(self.queue, submits.as_slice(), self.in_flight_fence);
+                .queue_submit(self.queue, submits.as_slice(), self.in_flight_fences[self.current_frame as usize]);
         }
 
         // Now we present our image to the screen
@@ -752,6 +761,8 @@ impl Renderer {
                 .queue_present(self.queue, &present_info)
         }
         .unwrap();
+
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 }
 
@@ -765,7 +776,10 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.window = Some(
             event_loop
-                .create_window(Window::default_attributes())
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Vulkan tutorial with Ash")
+                )
                 .unwrap(),
         );
         self.renderer = Some(Renderer::new(self.window.as_ref().unwrap()));
@@ -773,13 +787,15 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let window = self.window.as_ref().unwrap();
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                self.renderer.as_ref().unwrap().draw_frame();
-                self.window.as_ref().unwrap().request_redraw();
+                let renderer = self.renderer.as_mut().unwrap();
+                renderer.draw_frame();
+                window.request_redraw();
             }
             _ => (),
         }
@@ -788,10 +804,8 @@ impl ApplicationHandler for App {
 
 fn main() {
     let event_loop = EventLoop::new().unwrap();
-
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::default();
-
-    event_loop.run_app(&mut app);
+    event_loop.run_app(&mut app).unwrap();
 }
