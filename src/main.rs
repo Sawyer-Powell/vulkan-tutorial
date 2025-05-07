@@ -1,13 +1,16 @@
-use core::time;
+use core::{ffi, time};
 use std::{
     ffi::{CStr, CString},
     fs,
+    mem::offset_of,
     ops::Deref,
     thread,
 };
 
+use tracing::{debug, info, Instrument};
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
@@ -17,12 +20,14 @@ use winit::{
 use ash::{
     Device, Entry, Instance,
     khr::{surface, swapchain},
+    prelude::VkResult,
     util::read_spv,
     vk::{
-        self, CommandBuffer, CommandPool, ComponentMapping, DynamicState, Extent2D, Fence, Format,
-        Framebuffer, Image, ImageSubresourceRange, ImageView, Offset2D, PhysicalDevice, Pipeline,
-        Queue, Rect2D, RenderPass, Semaphore, ShaderModule, SurfaceFormatKHR, SurfaceKHR,
-        SwapchainKHR,
+        self, Buffer, BufferUsageFlags, CommandBuffer, CommandPool, ComponentMapping,
+        DescriptorPool, DescriptorSet, DescriptorSetLayout, DeviceMemory, DeviceSize, DynamicState,
+        Extent2D, Fence, Format, Framebuffer, Image, ImageSubresourceRange, ImageView, Offset2D,
+        PhysicalDevice, Pipeline, PipelineLayout, Queue, Rect2D, RenderPass, Semaphore,
+        ShaderModule, SurfaceFormatKHR, SurfaceKHR, SwapchainKHR,
     },
 };
 
@@ -44,13 +49,63 @@ struct Renderer {
     swapchain_image_views: Vec<ImageView>,
     render_pass: RenderPass,
     graphics_pipeline: Pipeline,
+    graphics_pipeline_layout: PipelineLayout,
     framebuffers: Vec<Framebuffer>,
     command_pool: CommandPool,
     command_buffers: Vec<CommandBuffer>,
+    vertex_buffer: Buffer,
+    uniform_buffers: Vec<Buffer>,
+    uniform_memories: Vec<DeviceMemory>,
+    uniform_handles: Vec<*mut ffi::c_void>,
+    descriptor_pool: DescriptorPool,
+    descriptor_sets: Vec<DescriptorSet>,
     image_available_semaphores: Vec<Semaphore>,
     render_finished_semaphores: Vec<Semaphore>,
     in_flight_fences: Vec<Fence>,
     current_frame: u32,
+    framebuffer_resized: bool,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct Vertex {
+    pos: [f32; 2],
+    color: [f32; 3],
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct Uniform {
+    looped: f32, // Value between 0 and 1 which wraps every second
+}
+
+impl Vertex {
+    fn get_binding_description() -> vk::VertexInputBindingDescription {
+        let binding_description = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX);
+
+        binding_description
+    }
+
+    fn get_attribute_descriptions() -> Vec<vk::VertexInputAttributeDescription> {
+        let position_description = vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(offset_of!(Vertex, pos) as u32);
+
+        let color_description = vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(offset_of!(Vertex, color) as u32);
+
+        let descriptions = vec![position_description, color_description];
+
+        descriptions
+    }
 }
 
 impl Renderer {
@@ -69,7 +124,8 @@ impl Renderer {
             .application_name(app_name)
             .application_version(0)
             .engine_name(app_name)
-            .engine_version(0);
+            .engine_version(0)
+            .api_version(vk::API_VERSION_1_2);
 
         let extension_names =
             ash_window::enumerate_required_extensions(window.display_handle().unwrap().as_raw())
@@ -89,8 +145,8 @@ impl Renderer {
 
         let createInfo = vk::InstanceCreateInfo::default()
             .application_info(&appInfo)
+            //.enabled_layer_names(layer_names.as_slice())
             .enabled_extension_names(&extension_names)
-            .enabled_layer_names(&layer_names)
             .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
 
         unsafe { entry.create_instance(&createInfo, None) }.unwrap()
@@ -353,7 +409,28 @@ impl Renderer {
         render_pass
     }
 
-    fn create_graphics_pipeline(device: &Device, render_pass: &RenderPass) -> Pipeline {
+    fn create_descriptor_layout(device: &Device) -> DescriptorSetLayout {
+        let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+        let bindings = [ubo_layout_binding];
+
+        let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+        let descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&create_info, None) }.unwrap();
+
+        descriptor_set_layout
+    }
+
+    fn create_graphics_pipeline(
+        device: &Device,
+        render_pass: &RenderPass,
+        descriptor_set_layout: &DescriptorSetLayout,
+    ) -> (Pipeline, PipelineLayout) {
         // Shaders
 
         let mut vertShaderFile = fs::File::open("vert.spv").unwrap();
@@ -376,7 +453,12 @@ impl Renderer {
 
         let shader_stages = vec![vertShaderStageInfo, fragShaderInfo];
 
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let binding_descriptions = [Vertex::get_binding_description()];
+        let attribute_descriptions = Vertex::get_attribute_descriptions();
+
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding_descriptions)
+            .vertex_attribute_descriptions(attribute_descriptions.as_slice());
 
         let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -439,7 +521,10 @@ impl Renderer {
 
         // Pipeline layout
 
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let layouts = [*descriptor_set_layout];
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
+
         let pipeline_layout =
             unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }.unwrap();
 
@@ -472,7 +557,7 @@ impl Renderer {
         .unwrap()
         .to_owned();
 
-        pipeline
+        (pipeline, pipeline_layout)
     }
 
     fn create_framebuffers(
@@ -546,7 +631,295 @@ impl Renderer {
         )
     }
 
+    fn find_memory_type(
+        instance: &Instance,
+        physical_device: &PhysicalDevice,
+        type_filter: u32,
+        properties: vk::MemoryPropertyFlags,
+    ) -> u32 {
+        let mem_properties =
+            unsafe { instance.get_physical_device_memory_properties(*physical_device) };
+
+        let (idx, _property) = mem_properties
+            .memory_types
+            .iter()
+            .enumerate()
+            .find(|(i, m)| {
+                let right_filter = (type_filter & (1 << i)) >= 1;
+                let right_property = (m.property_flags & properties) == properties;
+
+                right_filter && right_property
+            })
+            .expect("failed to find a suitable memory type!");
+
+        idx as u32
+    }
+
+    fn create_buffer(
+        instance: &Instance,
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        size: DeviceSize,
+        usage_flags: BufferUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> (Buffer, DeviceMemory) {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage_flags)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }.unwrap();
+
+        let memory_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let memory_type_idx = Self::find_memory_type(
+            instance,
+            physical_device,
+            memory_requirements.memory_type_bits,
+            properties,
+        );
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_idx);
+
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }.unwrap();
+
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }.unwrap();
+
+        (buffer, memory)
+    }
+
+    fn copy_buffer(
+        src_buffer: &Buffer,
+        dst_buffer: &Buffer,
+        command_pool: &CommandPool,
+        queue: &Queue,
+        device: &Device,
+        size: DeviceSize,
+    ) {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_pool(*command_pool)
+            .command_buffer_count(1);
+
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap();
+
+        let command_buffer = *command_buffers.first().unwrap();
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe { device.begin_command_buffer(command_buffer, &begin_info) }.unwrap();
+
+        let copy_region = vk::BufferCopy::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(size);
+
+        let regions = [copy_region];
+
+        unsafe { device.cmd_copy_buffer(command_buffer, *src_buffer, *dst_buffer, &regions) };
+
+        let command_buffers = [command_buffer];
+
+        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+
+        let submits = [submit_info];
+
+        unsafe { device.end_command_buffer(command_buffer) }.unwrap();
+
+        unsafe { device.queue_submit(*queue, &submits, vk::Fence::null()) }.unwrap();
+
+        unsafe { device.device_wait_idle() }.unwrap();
+
+        unsafe { device.free_command_buffers(*command_pool, &command_buffers) };
+    }
+
+    fn create_vertex_buffer(
+        instance: &Instance,
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        command_pool: &CommandPool,
+        queue: &Queue,
+        vertices: &Vec<Vertex>,
+    ) -> Buffer {
+        let buffer_size = (size_of::<Vertex>() * vertices.len()) as DeviceSize;
+
+        let (staging_buffer, staging_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        let data = unsafe {
+            device.map_memory(staging_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
+        }
+        .unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr(),
+                data as *mut Vertex,
+                size_of::<Vertex>() as usize,
+            )
+        };
+
+        unsafe {
+            device.unmap_memory(staging_memory);
+        };
+
+        let (vertex_buffer, vertex_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            BufferUsageFlags::TRANSFER_DST | BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        Self::copy_buffer(
+            &staging_buffer,
+            &vertex_buffer,
+            command_pool,
+            queue,
+            device,
+            buffer_size,
+        );
+
+        unsafe { device.destroy_buffer(staging_buffer, None) };
+
+        unsafe { device.free_memory(staging_memory, None) };
+
+        vertex_buffer
+    }
+
+    fn create_uniform_buffers(
+        instance: &Instance,
+        device: &Device,
+        physical_device: &PhysicalDevice,
+    ) -> (Vec<Buffer>, Vec<DeviceMemory>, Vec<*mut ffi::c_void>) {
+        let buffer_size = size_of::<Uniform>();
+
+        let buffer_info: (Vec<Buffer>, Vec<(DeviceMemory, *mut ffi::c_void)>) = (0
+            ..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| {
+                let (buffer, memory) = Self::create_buffer(
+                    instance,
+                    device,
+                    physical_device,
+                    buffer_size as u64,
+                    BufferUsageFlags::UNIFORM_BUFFER,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                );
+
+                let handle_into_buffer_memory = unsafe {
+                    device.map_memory(memory, 0, buffer_size as u64, vk::MemoryMapFlags::empty())
+                }
+                .unwrap();
+
+                (buffer, (memory, handle_into_buffer_memory))
+            })
+            .unzip();
+
+        let buffer = buffer_info.0;
+        let (memories, handles): (Vec<DeviceMemory>, Vec<*mut ffi::c_void>) =
+            buffer_info.1.into_iter().unzip();
+
+        (buffer, memories, handles)
+    }
+
+    fn create_descriptor_pool(device: &Device) -> DescriptorPool {
+        let pool_size = vk::DescriptorPoolSize::default()
+            .descriptor_count(MAX_FRAMES_IN_FLIGHT)
+            .ty(vk::DescriptorType::UNIFORM_BUFFER);
+
+        let pool_sizes = [pool_size];
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT);
+
+        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }.unwrap();
+
+        pool
+    }
+
+    fn create_descriptor_sets(
+        device: &Device,
+        descriptor_pool: &DescriptorPool,
+        descriptor_set_layout: &DescriptorSetLayout,
+        uniform_buffers: &Vec<Buffer>,
+    ) -> Vec<DescriptorSet> {
+        let layouts: Vec<DescriptorSetLayout> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| descriptor_set_layout.clone())
+            .collect();
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(*descriptor_pool)
+            .set_layouts(layouts.as_slice());
+
+        let descriptor_sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }.unwrap();
+
+        for i in (0..MAX_FRAMES_IN_FLIGHT) {
+            let uniform_size = size_of::<Uniform>();
+
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(uniform_buffers[i as usize])
+                .offset(0)
+                .range(uniform_size as DeviceSize);
+
+            let buffer_infos = [buffer_info];
+
+            let descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[i as usize])
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .buffer_info(&buffer_infos);
+
+            let descriptor_writes = [descriptor_write];
+
+            unsafe {
+                device.update_descriptor_sets(&descriptor_writes, &[]);
+            };
+        }
+
+        descriptor_sets
+    }
+
     fn new(window: &Window) -> Self {
+        let vertices = vec![
+            Vertex {
+                pos: [-0.5, -0.5],
+                color: [1., 0., 0.],
+            },
+            Vertex {
+                pos: [-0.25, 0.],
+                color: [0., 1., 0.],
+            },
+            Vertex {
+                pos: [-0.75, 0.],
+                color: [0., 0., 1.],
+            },
+            Vertex {
+                pos: [0.5, -0.5],
+                color: [1., 0., 0.],
+            },
+            Vertex {
+                pos: [0.75, 0.],
+                color: [0., 0., 1.],
+            },
+            Vertex {
+                pos: [0.25, 0.],
+                color: [0., 1., 0.],
+            },
+        ];
+
         let entry = unsafe { Entry::load() }.expect("failed to create instance!");
         let instance = Self::create_instance(&entry, window);
         let physical_device = Self::pick_physical_device(&instance);
@@ -560,7 +933,9 @@ impl Renderer {
             Self::get_image_views(&swapchain_format, &swapchain_images, &device);
 
         let render_pass = Self::create_render_pass(&swapchain_format, &device);
-        let graphics_pipeline = Self::create_graphics_pipeline(&device, &render_pass);
+        let descriptor_layout = Self::create_descriptor_layout(&device);
+        let (graphics_pipeline, graphics_pipeline_layout) =
+            Self::create_graphics_pipeline(&device, &render_pass, &descriptor_layout);
         let framebuffers = Self::create_framebuffers(
             &device,
             &swapchain_image_views,
@@ -569,6 +944,26 @@ impl Renderer {
         );
 
         let command_pool = Self::create_command_pool(&device, queue_family_index);
+        let vertex_buffer = Self::create_vertex_buffer(
+            &instance,
+            &device,
+            &physical_device,
+            &command_pool,
+            &queue,
+            &vertices,
+        );
+
+        let (uniform_buffers, uniform_memories, uniform_handles) =
+            Self::create_uniform_buffers(&instance, &device, &physical_device);
+
+        let descriptor_pool = Self::create_descriptor_pool(&device);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            &descriptor_pool,
+            &descriptor_layout,
+            &uniform_buffers,
+        );
+
         let command_buffers = Self::create_command_buffers(&device, &command_pool);
 
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
@@ -590,13 +985,21 @@ impl Renderer {
             swapchain_image_views,
             render_pass,
             graphics_pipeline,
+            graphics_pipeline_layout,
             framebuffers,
             command_pool,
             command_buffers,
+            vertex_buffer,
+            uniform_buffers,
+            uniform_memories,
+            uniform_handles,
+            descriptor_pool,
+            descriptor_sets,
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
-            current_frame: 0
+            current_frame: 0,
+            framebuffer_resized: false,
         }
     }
 
@@ -679,9 +1082,34 @@ impl Renderer {
             )
         };
 
+        // Bind our descriptor sets
+
+        let descriptor_sets = [self.descriptor_sets[self.current_frame as usize]];
+
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline_layout,
+                0,
+                &descriptor_sets,
+                &[]
+            )
+        };
+
+        // Bind our vertex buffer
+
+        let vertex_buffers = [self.vertex_buffer];
+        let offsets = [0 as u64];
+
+        unsafe {
+            self.device
+                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
+        };
+
         // Now we can issue the draw command for our triangles
 
-        unsafe { self.device.cmd_draw(command_buffer, 3, 1, 0, 0) };
+        unsafe { self.device.cmd_draw(command_buffer, 6, 1, 0, 0) };
 
         // Now we can end the render pass
 
@@ -690,7 +1118,70 @@ impl Renderer {
         unsafe { self.device.end_command_buffer(command_buffer) };
     }
 
-    fn draw_frame(&mut self) {
+    fn cleanup_swapchain(&mut self) {
+        unsafe {
+            self.framebuffers
+                .iter()
+                .for_each(|f| self.device.destroy_framebuffer(*f, None));
+
+            self.swapchain_image_views
+                .iter()
+                .for_each(|v| self.device.destroy_image_view(*v, None));
+
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+        }
+    }
+
+    fn recreate_swapchain(&mut self) {
+        // wait until the device finishes up any current work
+        unsafe {
+            self.device.device_wait_idle();
+        };
+
+        self.cleanup_swapchain();
+
+        let (swapchain, swapchain_loader, images, extent, format) = Self::create_swapchain(
+            &self.entry,
+            &self.instance,
+            &self.physical_device,
+            &self.device,
+            &self.surface,
+        );
+
+        let image_views = Self::get_image_views(&format, &images, &self.device);
+        let framebuffers =
+            Self::create_framebuffers(&self.device, &image_views, &self.render_pass, &extent);
+
+        self.swapchain = swapchain;
+        self.swapchain_loader = swapchain_loader;
+        self.swapchain_images = images;
+        self.swapchain_extent = extent;
+        self.swapchain_format = format;
+        self.swapchain_image_views = image_views;
+        self.framebuffers = framebuffers;
+    }
+
+    fn update_uniforms(&mut self, start_time: std::time::Instant) {
+        let now = std::time::Instant::now();
+        let since_start = now - start_time;
+        let looped = ((since_start.subsec_millis() as f32) / 1000.) as f32;
+
+        let new_uniform = Uniform { looped };
+        let uniform_size = size_of::<Uniform>();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &new_uniform as *const Uniform,
+                self.uniform_handles[self.current_frame as usize] as *mut Uniform,
+                uniform_size,
+            )
+        };
+    }
+
+    // Returns whether the swapchain needs to be recreated
+    fn draw_frame(&mut self, start_of_program: std::time::Instant) -> bool {
+        debug!("Starting to wait on fence");
         // First thing we do is wait for our GPU to finish recieving our command buffer
         let fences = vec![self.in_flight_fences[self.current_frame as usize]];
         unsafe {
@@ -699,18 +1190,29 @@ impl Renderer {
         }
         .unwrap();
 
-        unsafe { self.device.reset_fences(fences.as_slice()) }.unwrap();
-
+        debug!("Acquiring image from swapchain");
         // Now we can acquire an image from the swapchain
-        let (image_idx, _) = unsafe {
+        let result = unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 self.image_available_semaphores[self.current_frame as usize],
                 Fence::null(),
             )
-        }
-        .unwrap();
+        };
+
+        let image_idx = match result {
+            Ok((image_index, _)) => image_index,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                return true;
+            }
+            Err(error) => panic!(
+                "Error occurred while acquiring next image. Cause: {}",
+                error
+            ),
+        };
+
+        unsafe { self.device.reset_fences(fences.as_slice()) }.unwrap();
 
         // Make sure our command buffer is reset
 
@@ -722,9 +1224,13 @@ impl Renderer {
         }
         .unwrap();
 
+        debug!("Streaming commands into buffer");
         // Stream commands into our buffer
 
-        self.record_command_buffer(self.command_buffers[self.current_frame as usize], image_idx as usize);
+        self.record_command_buffer(
+            self.command_buffers[self.current_frame as usize],
+            image_idx as usize,
+        );
 
         // Now we submit the command buffer
 
@@ -733,17 +1239,23 @@ impl Renderer {
         let command_buffers = vec![self.command_buffers[self.current_frame as usize]];
         let signal_semaphores = vec![self.render_finished_semaphores[self.current_frame as usize]];
 
-        let submit_info = vk::SubmitInfo::default()
+        self.update_uniforms(start_of_program);
+
+        let submit_debug = vk::SubmitInfo::default()
             .wait_semaphores(wait_semaphores.as_slice())
             .wait_dst_stage_mask(wait_stages.as_slice())
             .command_buffers(command_buffers.as_slice())
             .signal_semaphores(signal_semaphores.as_slice());
 
-        let submits = vec![submit_info];
+        let submits = vec![submit_debug];
 
+        debug!("Submitting commands to buffer");
         unsafe {
-            self.device
-                .queue_submit(self.queue, submits.as_slice(), self.in_flight_fences[self.current_frame as usize]);
+            self.device.queue_submit(
+                self.queue,
+                submits.as_slice(),
+                self.in_flight_fences[self.current_frame as usize],
+            );
         }
 
         // Now we present our image to the screen
@@ -751,25 +1263,30 @@ impl Renderer {
         let swapchains = vec![self.swapchain];
         let image_indices = vec![image_idx];
 
-        let present_info = vk::PresentInfoKHR::default()
+        let present_debug = vk::PresentInfoKHR::default()
             .wait_semaphores(signal_semaphores.as_slice())
             .swapchains(swapchains.as_slice())
             .image_indices(image_indices.as_slice());
 
+        debug!("Queuing frame for presentation");
+
         unsafe {
             self.swapchain_loader
-                .queue_present(self.queue, &present_info)
+                .queue_present(self.queue, &present_debug)
         }
         .unwrap();
 
+        debug!("Finishing draw_frame");
         self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        false
     }
 }
 
-#[derive(Default)]
 struct App {
     window: Option<Window>,
     renderer: Option<Renderer>,
+    start_time: std::time::Instant,
 }
 
 impl ApplicationHandler for App {
@@ -779,6 +1296,8 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("Vulkan tutorial with Ash")
+                        .with_decorations(true)
+                        .with_min_inner_size(PhysicalSize::new(1920, 1080)),
                 )
                 .unwrap(),
         );
@@ -788,13 +1307,26 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let window = self.window.as_ref().unwrap();
+        let mut renderer = self.renderer.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
+            WindowEvent::Resized(_) => {
+                renderer.framebuffer_resized = true;
+            }
             WindowEvent::RedrawRequested => {
-                let renderer = self.renderer.as_mut().unwrap();
-                renderer.draw_frame();
+                if (renderer.draw_frame(self.start_time) || renderer.framebuffer_resized) {
+                    let size = window.inner_size();
+                    if size.width > 0 && size.height > 0 {
+                        debug!("Recreating swapchain");
+                        renderer.framebuffer_resized = false;
+                        renderer.recreate_swapchain();
+                    } else {
+                        return;
+                    }
+                }
+
                 window.request_redraw();
             }
             _ => (),
@@ -803,9 +1335,18 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .init();
 
-    let mut app = App::default();
+    let event_loop = EventLoop::new().unwrap();
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = App {
+        window: None,
+        renderer: None,
+        start_time: std::time::Instant::now(),
+    };
+
     event_loop.run_app(&mut app).unwrap();
 }
