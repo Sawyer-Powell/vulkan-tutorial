@@ -1,7 +1,9 @@
+COMP_SHADER = src/shaders/shader.comp
 VERT_SHADER = src/shaders/shader.vert
 FRAG_SHADER = src/shaders/shader.frag
 
-shaders: $(VERT_SHADER) $(FRAG_SHADER)
+shaders: $(COMP_SHADER) $(VERT_SHADER) $(FRAG_SHADER)
+	glslc $(COMP_SHADER) -o comp.spv
 	glslc $(VERT_SHADER) -o vert.spv
 	glslc $(FRAG_SHADER) -o frag.spv
 

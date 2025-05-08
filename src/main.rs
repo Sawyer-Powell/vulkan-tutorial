@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use tracing::{debug, info, Instrument};
+use tracing::{Instrument, debug, info};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -50,13 +50,16 @@ struct Renderer {
     render_pass: RenderPass,
     graphics_pipeline: Pipeline,
     graphics_pipeline_layout: PipelineLayout,
+    compute_pipeline: Pipeline,
+    compute_pipeline_layout: PipelineLayout,
     framebuffers: Vec<Framebuffer>,
     command_pool: CommandPool,
     command_buffers: Vec<CommandBuffer>,
-    vertex_buffer: Buffer,
     uniform_buffers: Vec<Buffer>,
     uniform_memories: Vec<DeviceMemory>,
     uniform_handles: Vec<*mut ffi::c_void>,
+    storage_buffers: Vec<Buffer>,
+    storage_memories: Vec<DeviceMemory>,
     descriptor_pool: DescriptorPool,
     descriptor_sets: Vec<DescriptorSet>,
     image_available_semaphores: Vec<Semaphore>,
@@ -68,22 +71,28 @@ struct Renderer {
 
 #[derive(Debug)]
 #[repr(C)]
+struct Uniform {
+    looped: f32, // Value between 0 and 1 which wraps every second
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct SSBO {
+    pos: [f32; 2],
+}
+
+#[derive(Debug)]
+#[repr(C)]
 struct Vertex {
     pos: [f32; 2],
     color: [f32; 3],
 }
 
-#[derive(Debug)]
-#[repr(C)]
-struct Uniform {
-    looped: f32, // Value between 0 and 1 which wraps every second
-}
-
-impl Vertex {
+impl SSBO {
     fn get_binding_description() -> vk::VertexInputBindingDescription {
         let binding_description = vk::VertexInputBindingDescription::default()
             .binding(0)
-            .stride(size_of::<Vertex>() as u32)
+            .stride(size_of::<SSBO>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX);
 
         binding_description
@@ -94,27 +103,15 @@ impl Vertex {
             .binding(0)
             .location(0)
             .format(vk::Format::R32G32_SFLOAT)
-            .offset(offset_of!(Vertex, pos) as u32);
+            .offset(offset_of!(SSBO, pos) as u32);
 
-        let color_description = vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(1)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(offset_of!(Vertex, color) as u32);
-
-        let descriptions = vec![position_description, color_description];
+        let descriptions = vec![position_description];
 
         descriptions
     }
 }
 
 impl Renderer {
-    fn run(&mut self) {}
-
-    fn mainLoop(&mut self) {
-        todo!();
-    }
-
     fn cleanup(&mut self) {}
 
     fn create_instance(entry: &Entry, window: &Window) -> Instance {
@@ -145,7 +142,7 @@ impl Renderer {
 
         let createInfo = vk::InstanceCreateInfo::default()
             .application_info(&appInfo)
-            //.enabled_layer_names(layer_names.as_slice())
+            .enabled_layer_names(layer_names.as_slice())
             .enabled_extension_names(&extension_names)
             .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
 
@@ -353,16 +350,6 @@ impl Renderer {
     }
 
     fn create_render_pass(format: &Format, device: &Device) -> RenderPass {
-        let dependency = vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-
-        let dependencies = vec![dependency];
-
         let color_attachment = vk::AttachmentDescription::default()
             .format(*format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -399,6 +386,16 @@ impl Renderer {
 
         let subpasses = vec![subpass];
 
+        let dependency = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+        let dependencies = vec![dependency];
+
         let render_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(attachments.as_slice())
             .subpasses(subpasses.as_slice())
@@ -416,7 +413,23 @@ impl Renderer {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-        let bindings = [ubo_layout_binding];
+        let ssbo_last_frame_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+
+        let ssbo_this_frame_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+
+        let bindings = [
+            ubo_layout_binding,
+            ssbo_last_frame_binding,
+            ssbo_this_frame_binding,
+        ];
 
         let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -424,6 +437,44 @@ impl Renderer {
             unsafe { device.create_descriptor_set_layout(&create_info, None) }.unwrap();
 
         descriptor_set_layout
+    }
+
+    fn create_compute_pipeline(
+        device: &Device,
+        render_pass: &RenderPass,
+        descriptor_set_layout: &DescriptorSetLayout,
+    ) -> (Pipeline, PipelineLayout) {
+        let mut compute_shader_file = fs::File::open("comp.spv").unwrap();
+        let compute_shader_words = read_spv(&mut compute_shader_file).unwrap();
+        let compute_shader_module = Self::create_shader_module(&compute_shader_words, device);
+
+        let compute_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(compute_shader_module)
+            .name(c"main");
+
+        let layouts = [*descriptor_set_layout];
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
+
+        let pipeline_layout =
+            unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }.unwrap();
+
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .layout(pipeline_layout)
+            .stage(compute_stage_info);
+
+        let create_infos = [pipeline_info];
+
+        let pipeline = unsafe {
+            device.create_compute_pipelines(vk::PipelineCache::null(), &create_infos, None)
+        }
+        .unwrap()
+        .first()
+        .unwrap()
+        .to_owned();
+
+        (pipeline, pipeline_layout)
     }
 
     fn create_graphics_pipeline(
@@ -453,8 +504,8 @@ impl Renderer {
 
         let shader_stages = vec![vertShaderStageInfo, fragShaderInfo];
 
-        let binding_descriptions = [Vertex::get_binding_description()];
-        let attribute_descriptions = Vertex::get_attribute_descriptions();
+        let binding_descriptions = [SSBO::get_binding_description()];
+        let attribute_descriptions = SSBO::get_attribute_descriptions();
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&binding_descriptions)
@@ -797,6 +848,81 @@ impl Renderer {
         vertex_buffer
     }
 
+    fn create_storage_buffers(
+        initial_data: &Vec<SSBO>,
+        instance: &Instance,
+        device: &Device,
+        queue: &Queue,
+        physical_device: &PhysicalDevice,
+        command_pool: &CommandPool,
+        storage_buffer_len: usize
+    ) -> (Vec<Buffer>, Vec<DeviceMemory>) {
+        let buffer_size = size_of::<SSBO>() * storage_buffer_len;
+
+        let (staging_buffer, staging_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size as DeviceSize,
+            BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        // Copy data into staging buffer
+
+        let ptr_into_memory = unsafe {
+            device.map_memory(
+                staging_memory,
+                0,
+                buffer_size as DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                initial_data.as_ptr(),
+                ptr_into_memory as *mut SSBO,
+                buffer_size,
+            )
+        };
+
+        unsafe { device.unmap_memory(staging_memory) };
+
+        let (storage_buffers, storage_memories): (Vec<Buffer>, Vec<DeviceMemory>) = (0
+            ..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| {
+                let (storage_buffer, storage_memory) = Self::create_buffer(
+                    instance,
+                    device,
+                    physical_device,
+                    buffer_size as DeviceSize,
+                    BufferUsageFlags::TRANSFER_DST
+                        | BufferUsageFlags::STORAGE_BUFFER
+                        | BufferUsageFlags::VERTEX_BUFFER,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                );
+
+                Self::copy_buffer(
+                    &staging_buffer,
+                    &storage_buffer,
+                    command_pool,
+                    queue,
+                    device,
+                    buffer_size as DeviceSize,
+                );
+
+                (storage_buffer, storage_memory)
+            })
+            .unzip();
+
+        unsafe { device.destroy_buffer(staging_buffer, None) };
+        unsafe { device.free_memory(staging_memory, None) };
+
+        (storage_buffers, storage_memories)
+    }
+
     fn create_uniform_buffers(
         instance: &Instance,
         device: &Device,
@@ -833,11 +959,15 @@ impl Renderer {
     }
 
     fn create_descriptor_pool(device: &Device) -> DescriptorPool {
-        let pool_size = vk::DescriptorPoolSize::default()
+        let uniform_pool_size = vk::DescriptorPoolSize::default()
             .descriptor_count(MAX_FRAMES_IN_FLIGHT)
             .ty(vk::DescriptorType::UNIFORM_BUFFER);
 
-        let pool_sizes = [pool_size];
+        let storage_buffers_pool_size = vk::DescriptorPoolSize::default()
+            .descriptor_count(MAX_FRAMES_IN_FLIGHT * 2)
+            .ty(vk::DescriptorType::STORAGE_BUFFER);
+
+        let pool_sizes = [uniform_pool_size, storage_buffers_pool_size];
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
@@ -853,6 +983,8 @@ impl Renderer {
         descriptor_pool: &DescriptorPool,
         descriptor_set_layout: &DescriptorSetLayout,
         uniform_buffers: &Vec<Buffer>,
+        storage_buffers: &Vec<Buffer>,
+        storage_buffer_len: usize,
     ) -> Vec<DescriptorSet> {
         let layouts: Vec<DescriptorSetLayout> = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|_| descriptor_set_layout.clone())
@@ -866,23 +998,54 @@ impl Renderer {
 
         for i in (0..MAX_FRAMES_IN_FLIGHT) {
             let uniform_size = size_of::<Uniform>();
+            let ssbo_size = size_of::<SSBO>() * storage_buffer_len;
 
-            let buffer_info = vk::DescriptorBufferInfo::default()
+            let uniform_buffer_info = vk::DescriptorBufferInfo::default()
                 .buffer(uniform_buffers[i as usize])
                 .offset(0)
                 .range(uniform_size as DeviceSize);
 
-            let buffer_infos = [buffer_info];
+            let last_frame_buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(storage_buffers[((i + 1) % MAX_FRAMES_IN_FLIGHT) as usize])
+                .offset(0)
+                .range(ssbo_size as DeviceSize);
 
-            let descriptor_write = vk::WriteDescriptorSet::default()
+            let this_frame_buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(storage_buffers[i as usize])
+                .offset(0)
+                .range(ssbo_size as DeviceSize);
+
+            let uniform_buffer_infos = [uniform_buffer_info];
+
+            let uniform_dwrite = vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_sets[i as usize])
                 .dst_binding(0)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                .buffer_info(&buffer_infos);
+                .buffer_info(&uniform_buffer_infos);
 
-            let descriptor_writes = [descriptor_write];
+            let last_frame_buffer_infos = [last_frame_buffer_info];
+
+            let last_frame_dwrite = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[i as usize])
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .buffer_info(&last_frame_buffer_infos);
+
+            let this_frame_buffer_infos = [this_frame_buffer_info];
+
+            let this_frame_dwrite = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_sets[i as usize])
+                .dst_binding(2)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .buffer_info(&this_frame_buffer_infos);
+
+            let descriptor_writes = [uniform_dwrite, last_frame_dwrite, this_frame_dwrite];
 
             unsafe {
                 device.update_descriptor_sets(&descriptor_writes, &[]);
@@ -893,31 +1056,10 @@ impl Renderer {
     }
 
     fn new(window: &Window) -> Self {
-        let vertices = vec![
-            Vertex {
-                pos: [-0.5, -0.5],
-                color: [1., 0., 0.],
-            },
-            Vertex {
-                pos: [-0.25, 0.],
-                color: [0., 1., 0.],
-            },
-            Vertex {
-                pos: [-0.75, 0.],
-                color: [0., 0., 1.],
-            },
-            Vertex {
-                pos: [0.5, -0.5],
-                color: [1., 0., 0.],
-            },
-            Vertex {
-                pos: [0.75, 0.],
-                color: [0., 0., 1.],
-            },
-            Vertex {
-                pos: [0.25, 0.],
-                color: [0., 1., 0.],
-            },
+        let ssbos = vec![
+            SSBO { pos: [-0.5, -0.5] },
+            SSBO { pos: [-0.25, 0.] },
+            SSBO { pos: [-0.75, 0.] },
         ];
 
         let entry = unsafe { Entry::load() }.expect("failed to create instance!");
@@ -934,8 +1076,14 @@ impl Renderer {
 
         let render_pass = Self::create_render_pass(&swapchain_format, &device);
         let descriptor_layout = Self::create_descriptor_layout(&device);
+
         let (graphics_pipeline, graphics_pipeline_layout) =
             Self::create_graphics_pipeline(&device, &render_pass, &descriptor_layout);
+
+        // We set up the same descriptors for the compute pipeline as the graphics pipeline (same uniform buffer)
+        let (compute_pipeline, compute_pipeline_layout) =
+            Self::create_compute_pipeline(&device, &render_pass, &descriptor_layout);
+
         let framebuffers = Self::create_framebuffers(
             &device,
             &swapchain_image_views,
@@ -944,17 +1092,19 @@ impl Renderer {
         );
 
         let command_pool = Self::create_command_pool(&device, queue_family_index);
-        let vertex_buffer = Self::create_vertex_buffer(
-            &instance,
-            &device,
-            &physical_device,
-            &command_pool,
-            &queue,
-            &vertices,
-        );
 
         let (uniform_buffers, uniform_memories, uniform_handles) =
             Self::create_uniform_buffers(&instance, &device, &physical_device);
+
+        let (storage_buffers, storage_memories) = Self::create_storage_buffers(
+            &ssbos,
+            &instance,
+            &device,
+            &queue,
+            &physical_device,
+            &command_pool,
+            ssbos.len()
+        );
 
         let descriptor_pool = Self::create_descriptor_pool(&device);
         let descriptor_sets = Self::create_descriptor_sets(
@@ -962,6 +1112,8 @@ impl Renderer {
             &descriptor_pool,
             &descriptor_layout,
             &uniform_buffers,
+            &storage_buffers,
+            ssbos.len(),
         );
 
         let command_buffers = Self::create_command_buffers(&device, &command_pool);
@@ -986,13 +1138,16 @@ impl Renderer {
             render_pass,
             graphics_pipeline,
             graphics_pipeline_layout,
+            compute_pipeline,
+            compute_pipeline_layout,
             framebuffers,
             command_pool,
             command_buffers,
-            vertex_buffer,
             uniform_buffers,
             uniform_memories,
             uniform_handles,
+            storage_buffers,
+            storage_memories,
             descriptor_pool,
             descriptor_sets,
             image_available_semaphores,
@@ -1013,6 +1168,30 @@ impl Renderer {
                 .begin_command_buffer(command_buffer, &begin_info)
         }
         .unwrap();
+
+        // Bind the compute pipeline
+        let descriptor_sets = [self.descriptor_sets[self.current_frame as usize]];
+
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline,
+            )
+        };
+
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline_layout,
+                0,
+                &descriptor_sets,
+                &[],
+            )
+        };
+
+        unsafe { self.device.cmd_dispatch(command_buffer, 1, 1, 1) }
 
         // Begin our render pass
 
@@ -1072,7 +1251,7 @@ impl Renderer {
                 .cmd_set_scissor(command_buffer, 0, scissors.as_slice())
         };
 
-        // Need to bind the pipeline
+        // Need to bind the graphics pipeline
 
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -1082,10 +1261,6 @@ impl Renderer {
             )
         };
 
-        // Bind our descriptor sets
-
-        let descriptor_sets = [self.descriptor_sets[self.current_frame as usize]];
-
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 command_buffer,
@@ -1093,18 +1268,17 @@ impl Renderer {
                 self.graphics_pipeline_layout,
                 0,
                 &descriptor_sets,
-                &[]
+                &[],
             )
         };
 
         // Bind our vertex buffer
 
-        let vertex_buffers = [self.vertex_buffer];
+        let vertex_buffers = [self.storage_buffers[self.current_frame as usize]];
         let offsets = [0 as u64];
 
         unsafe {
-            self.device
-                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
+            self.device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
         };
 
         // Now we can issue the draw command for our triangles

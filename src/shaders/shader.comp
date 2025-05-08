@@ -1,0 +1,27 @@
+#version 450
+
+struct SSBO {
+  vec2 pos;
+};
+
+layout (binding = 0) uniform ParameterUBO {
+  float looped;
+} ubo;
+
+layout (std140, binding = 1) readonly buffer SSBOIn {
+  SSBO data_in[ ];
+} ssbo_in;
+
+layout (std140, binding = 2) buffer SSBOOut {
+  SSBO data_out[ ];
+} ssbo_out;
+
+layout(local_size_x = 3, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+  uint index = gl_GlobalInvocationID.x;
+
+  SSBO data_in = ssbo_in.data_in[index];
+
+  ssbo_out.data_out[index] = data_in;
+}
