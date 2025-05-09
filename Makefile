@@ -7,8 +7,8 @@ shaders: $(COMP_SHADER) $(VERT_SHADER) $(FRAG_SHADER)
 	glslc $(VERT_SHADER) -o vert.spv
 	glslc $(FRAG_SHADER) -o frag.spv
 
-prod: Cargo.toml *.rs shaders
-	cargo build --production
+prod: Cargo.toml shaders
+	cargo build --release
 
 run: shaders
 	cargo run

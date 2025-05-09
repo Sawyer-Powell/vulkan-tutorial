@@ -2,26 +2,91 @@
 
 struct SSBO {
   vec2 pos;
+  vec2 vel;
 };
 
 layout (binding = 0) uniform ParameterUBO {
-  float looped;
+  float delta_time;
+  uint ssbo_len;
 } ubo;
 
-layout (std140, binding = 1) readonly buffer SSBOIn {
+layout (binding = 1) readonly buffer SSBOIn {
   SSBO data_in[ ];
 } ssbo_in;
 
-layout (std140, binding = 2) buffer SSBOOut {
+layout (binding = 2) buffer SSBOOut {
   SSBO data_out[ ];
 } ssbo_out;
 
-layout(local_size_x = 3, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
   uint index = gl_GlobalInvocationID.x;
 
-  SSBO data_in = ssbo_in.data_in[index];
+  if (index > ubo.ssbo_len - 1) {
+    return;
+  }
 
-  ssbo_out.data_out[index] = data_in;
+  vec2 my_pos = ssbo_in.data_in[index].pos;
+  vec2 my_vel = ssbo_in.data_in[index].vel;
+
+  float separation_factor = 0.01;
+  float alignment_factor = 0.001;
+  float cohesion_factor = 0.1;
+
+  vec2 separation_vec = vec2(0.0, 0.0);
+  vec2 alignment_vec = vec2(0.0, 0.0);
+  vec2 average_position = vec2(0.0, 0.0);
+  float number_of_neighbors = 0.0;
+
+  for (int i = 0; i < ubo.ssbo_len; i++) {
+    if (i == index) { continue; }
+
+    vec2 neighbor_pos = ssbo_in.data_in[i].pos;
+    vec2 neighbor_vel = ssbo_in.data_in[i].vel;
+
+    float dist = distance(neighbor_pos, my_pos);
+
+    if (dist > 0.08) { continue; }
+
+    if (dist < 0.02) {
+      separation_vec += my_pos - neighbor_pos;
+      continue;
+    }
+
+    alignment_vec += neighbor_vel;
+    number_of_neighbors += 1.;
+
+    average_position += neighbor_pos;
+  }
+
+  // Separation
+  my_vel += separation_vec*separation_factor;
+  // Alignment
+  if (number_of_neighbors > 0) {
+    alignment_vec = alignment_vec / number_of_neighbors;
+    my_vel += (alignment_vec - my_vel)*alignment_factor;
+
+    average_position = average_position / number_of_neighbors;
+    my_vel += (average_position - my_pos)*cohesion_factor;
+  }
+
+  my_vel = normalize(my_vel);
+
+  my_pos += my_vel * ubo.delta_time;
+
+  if (my_pos.x > 1.2) {
+    my_pos.x = -1.2;
+  } else if (my_pos.x < -1.2) {
+    my_pos.x = 1.2;
+  }
+
+  if (my_pos.y > 1.2) {
+    my_pos.y = -1.2;
+  } else if (my_pos.y < -1.2) {
+    my_pos.y = 1.2;
+  }
+
+  ssbo_out.data_out[index].pos = my_pos;
+  ssbo_out.data_out[index].vel = my_vel;
 }

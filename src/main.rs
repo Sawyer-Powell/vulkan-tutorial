@@ -1,13 +1,8 @@
-use core::{ffi, time};
-use std::{
-    ffi::{CStr, CString},
-    fs,
-    mem::offset_of,
-    ops::Deref,
-    thread,
-};
+use core::ffi;
+use rand::Rng;
+use std::{fs, mem::offset_of};
 
-use tracing::{Instrument, debug, info};
+use tracing::debug;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -20,7 +15,6 @@ use winit::{
 use ash::{
     Device, Entry, Instance,
     khr::{surface, swapchain},
-    prelude::VkResult,
     util::read_spv,
     vk::{
         self, Buffer, BufferUsageFlags, CommandBuffer, CommandPool, ComponentMapping,
@@ -67,18 +61,23 @@ struct Renderer {
     in_flight_fences: Vec<Fence>,
     current_frame: u32,
     framebuffer_resized: bool,
+    shader_local_size: [u32; 3],
+    draws_per_ssbo: u32,
+    initial_data_size: u32,
 }
 
 #[derive(Debug)]
 #[repr(C)]
 struct Uniform {
-    looped: f32, // Value between 0 and 1 which wraps every second
+    delta_time: f32, // Value between 0 and 1 which wraps every second
+    ssbo_len: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct SSBO {
     pos: [f32; 2],
+    vel: [f32; 2],
 }
 
 #[derive(Debug)]
@@ -142,7 +141,7 @@ impl Renderer {
 
         let createInfo = vk::InstanceCreateInfo::default()
             .application_info(&appInfo)
-            .enabled_layer_names(layer_names.as_slice())
+            //.enabled_layer_names(layer_names.as_slice())
             .enabled_extension_names(&extension_names)
             .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
 
@@ -263,11 +262,11 @@ impl Renderer {
         }
         .unwrap();
 
-        if !present_modes.contains(&vk::PresentModeKHR::FIFO) {
+        if !present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
             panic!("FIFO not supported as present mode on surface!");
         }
 
-        let present_mode = vk::PresentModeKHR::FIFO;
+        let present_mode = vk::PresentModeKHR::IMMEDIATE;
 
         // We request at least one more image, so we're not waiting around for
         // the driver to give us another image
@@ -411,19 +410,19 @@ impl Renderer {
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX);
+            .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX);
 
         let ssbo_last_frame_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+            .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX);
 
         let ssbo_this_frame_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(2)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+            .stage_flags(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX);
 
         let bindings = [
             ubo_layout_binding,
@@ -441,7 +440,6 @@ impl Renderer {
 
     fn create_compute_pipeline(
         device: &Device,
-        render_pass: &RenderPass,
         descriptor_set_layout: &DescriptorSetLayout,
     ) -> (Pipeline, PipelineLayout) {
         let mut compute_shader_file = fs::File::open("comp.spv").unwrap();
@@ -484,32 +482,34 @@ impl Renderer {
     ) -> (Pipeline, PipelineLayout) {
         // Shaders
 
-        let mut vertShaderFile = fs::File::open("vert.spv").unwrap();
-        let vertShaderWords = read_spv(&mut vertShaderFile).unwrap();
-        let mut fragShaderFile = fs::File::open("frag.spv").unwrap();
-        let fragShaderWords = read_spv(&mut fragShaderFile).unwrap();
+        let mut vert_shader_file = fs::File::open("vert.spv").unwrap();
+        let vert_shader_words = read_spv(&mut vert_shader_file).unwrap();
+        let mut frag_shader_file = fs::File::open("frag.spv").unwrap();
+        let frag_shader_words = read_spv(&mut frag_shader_file).unwrap();
 
-        let vertShaderModule = Self::create_shader_module(&vertShaderWords, device);
-        let fragShaderModule = Self::create_shader_module(&fragShaderWords, device);
+        let vert_shader_module = Self::create_shader_module(&vert_shader_words, device);
+        let frag_shader_module = Self::create_shader_module(&frag_shader_words, device);
 
-        let vertShaderStageInfo = vk::PipelineShaderStageCreateInfo::default()
+        let vert_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertShaderModule)
+            .module(vert_shader_module)
             .name(c"main");
 
-        let fragShaderInfo = vk::PipelineShaderStageCreateInfo::default()
+        let frag_shader_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(fragShaderModule)
+            .module(frag_shader_module)
             .name(c"main");
 
-        let shader_stages = vec![vertShaderStageInfo, fragShaderInfo];
+        let shader_stages = vec![vert_shader_stage_info, frag_shader_info];
 
-        let binding_descriptions = [SSBO::get_binding_description()];
-        let attribute_descriptions = SSBO::get_attribute_descriptions();
+        //let binding_descriptions = [SSBO::get_binding_description()];
+        //let attribute_descriptions = SSBO::get_attribute_descriptions();
+        let binding_descriptions = [];
+        let attribute_descriptions = [];
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&binding_descriptions)
-            .vertex_attribute_descriptions(attribute_descriptions.as_slice());
+            .vertex_attribute_descriptions(&attribute_descriptions);
 
         let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -815,7 +815,7 @@ impl Renderer {
             std::ptr::copy_nonoverlapping(
                 vertices.as_ptr(),
                 data as *mut Vertex,
-                size_of::<Vertex>() as usize,
+                size_of::<Vertex>(),
             )
         };
 
@@ -823,7 +823,7 @@ impl Renderer {
             device.unmap_memory(staging_memory);
         };
 
-        let (vertex_buffer, vertex_memory) = Self::create_buffer(
+        let (vertex_buffer, _) = Self::create_buffer(
             instance,
             device,
             physical_device,
@@ -855,7 +855,7 @@ impl Renderer {
         queue: &Queue,
         physical_device: &PhysicalDevice,
         command_pool: &CommandPool,
-        storage_buffer_len: usize
+        storage_buffer_len: usize,
     ) -> (Vec<Buffer>, Vec<DeviceMemory>) {
         let buffer_size = size_of::<SSBO>() * storage_buffer_len;
 
@@ -880,13 +880,11 @@ impl Renderer {
         }
         .unwrap();
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                initial_data.as_ptr(),
-                ptr_into_memory as *mut SSBO,
-                buffer_size,
-            )
+        let mut align = unsafe {
+            ash::util::Align::new(ptr_into_memory, align_of::<f32>() as _, buffer_size as u64)
         };
+
+        align.copy_from_slice(initial_data.as_slice());
 
         unsafe { device.unmap_memory(staging_memory) };
 
@@ -996,7 +994,7 @@ impl Renderer {
 
         let descriptor_sets = unsafe { device.allocate_descriptor_sets(&alloc_info) }.unwrap();
 
-        for i in (0..MAX_FRAMES_IN_FLIGHT) {
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
             let uniform_size = size_of::<Uniform>();
             let ssbo_size = size_of::<SSBO>() * storage_buffer_len;
 
@@ -1055,13 +1053,12 @@ impl Renderer {
         descriptor_sets
     }
 
-    fn new(window: &Window) -> Self {
-        let ssbos = vec![
-            SSBO { pos: [-0.5, -0.5] },
-            SSBO { pos: [-0.25, 0.] },
-            SSBO { pos: [-0.75, 0.] },
-        ];
-
+    fn new(
+        window: &Window,
+        initial_data: &Vec<SSBO>,
+        shader_local_size: [u32; 3],
+        draws_per_ssbo: u32,
+    ) -> Self {
         let entry = unsafe { Entry::load() }.expect("failed to create instance!");
         let instance = Self::create_instance(&entry, window);
         let physical_device = Self::pick_physical_device(&instance);
@@ -1082,7 +1079,7 @@ impl Renderer {
 
         // We set up the same descriptors for the compute pipeline as the graphics pipeline (same uniform buffer)
         let (compute_pipeline, compute_pipeline_layout) =
-            Self::create_compute_pipeline(&device, &render_pass, &descriptor_layout);
+            Self::create_compute_pipeline(&device, &descriptor_layout);
 
         let framebuffers = Self::create_framebuffers(
             &device,
@@ -1097,13 +1094,13 @@ impl Renderer {
             Self::create_uniform_buffers(&instance, &device, &physical_device);
 
         let (storage_buffers, storage_memories) = Self::create_storage_buffers(
-            &ssbos,
+            &initial_data,
             &instance,
             &device,
             &queue,
             &physical_device,
             &command_pool,
-            ssbos.len()
+            initial_data.len(),
         );
 
         let descriptor_pool = Self::create_descriptor_pool(&device);
@@ -1113,7 +1110,7 @@ impl Renderer {
             &descriptor_layout,
             &uniform_buffers,
             &storage_buffers,
-            ssbos.len(),
+            initial_data.len(),
         );
 
         let command_buffers = Self::create_command_buffers(&device, &command_pool);
@@ -1155,6 +1152,9 @@ impl Renderer {
             in_flight_fences,
             current_frame: 0,
             framebuffer_resized: false,
+            shader_local_size,
+            draws_per_ssbo,
+            initial_data_size: initial_data.len() as u32,
         }
     }
 
@@ -1191,7 +1191,13 @@ impl Renderer {
             )
         };
 
-        unsafe { self.device.cmd_dispatch(command_buffer, 1, 1, 1) }
+        let invocations_x =
+            ((self.initial_data_size as f32) / (self.shader_local_size[0] as f32)).ceil() as u32;
+
+        unsafe {
+            self.device
+                .cmd_dispatch(command_buffer, invocations_x, 1, 1)
+        };
 
         // Begin our render pass
 
@@ -1241,7 +1247,7 @@ impl Renderer {
         };
 
         let scissor = vk::Rect2D::default()
-            .offset(vk::Offset2D::default().x(0).y(0))
+            .offset(Offset2D::default().x(0).y(0))
             .extent(self.swapchain_extent);
 
         let scissors = vec![scissor];
@@ -1278,12 +1284,21 @@ impl Renderer {
         let offsets = [0 as u64];
 
         unsafe {
-            self.device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
+            self.device
+                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets)
         };
 
         // Now we can issue the draw command for our triangles
 
-        unsafe { self.device.cmd_draw(command_buffer, 6, 1, 0, 0) };
+        unsafe {
+            self.device.cmd_draw(
+                command_buffer,
+                self.initial_data_size * self.draws_per_ssbo,
+                1,
+                0,
+                0,
+            )
+        };
 
         // Now we can end the render pass
 
@@ -1336,12 +1351,11 @@ impl Renderer {
         self.framebuffers = framebuffers;
     }
 
-    fn update_uniforms(&mut self, start_time: std::time::Instant) {
-        let now = std::time::Instant::now();
-        let since_start = now - start_time;
-        let looped = ((since_start.subsec_millis() as f32) / 1000.) as f32;
-
-        let new_uniform = Uniform { looped };
+    fn update_uniforms(&mut self, delta_time: f32) {
+        let new_uniform = Uniform {
+            delta_time,
+            ssbo_len: self.initial_data_size,
+        };
         let uniform_size = size_of::<Uniform>();
 
         unsafe {
@@ -1354,7 +1368,7 @@ impl Renderer {
     }
 
     // Returns whether the swapchain needs to be recreated
-    fn draw_frame(&mut self, start_of_program: std::time::Instant) -> bool {
+    fn draw_frame(&mut self, delta_time: f32) -> bool {
         debug!("Starting to wait on fence");
         // First thing we do is wait for our GPU to finish recieving our command buffer
         let fences = vec![self.in_flight_fences[self.current_frame as usize]];
@@ -1413,7 +1427,7 @@ impl Renderer {
         let command_buffers = vec![self.command_buffers[self.current_frame as usize]];
         let signal_semaphores = vec![self.render_finished_semaphores[self.current_frame as usize]];
 
-        self.update_uniforms(start_of_program);
+        self.update_uniforms(delta_time);
 
         let submit_debug = vk::SubmitInfo::default()
             .wait_semaphores(wait_semaphores.as_slice())
@@ -1460,7 +1474,10 @@ impl Renderer {
 struct App {
     window: Option<Window>,
     renderer: Option<Renderer>,
-    start_time: std::time::Instant,
+    last_frame: std::time::Instant,
+    initial_data: Vec<SSBO>,
+    shader_local_size: [u32; 3],
+    draws_per_ssbo: u32,
 }
 
 impl ApplicationHandler for App {
@@ -1469,19 +1486,25 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Vulkan tutorial with Ash")
+                        .with_title("boids")
                         .with_decorations(true)
-                        .with_min_inner_size(PhysicalSize::new(1920, 1080)),
+                        .with_min_inner_size(PhysicalSize::new(1600, 1600)),
                 )
                 .unwrap(),
         );
-        self.renderer = Some(Renderer::new(self.window.as_ref().unwrap()));
+        self.renderer = Some(Renderer::new(
+            self.window.as_ref().unwrap(),
+            &self.initial_data,
+            self.shader_local_size.clone(),
+            self.draws_per_ssbo.clone(),
+        ));
         self.window.as_ref().unwrap().request_redraw();
+        self.last_frame = std::time::Instant::now();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let window = self.window.as_ref().unwrap();
-        let mut renderer = self.renderer.as_mut().unwrap();
+        let renderer = self.renderer.as_mut().unwrap();
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -1489,23 +1512,39 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(_) => {
                 renderer.framebuffer_resized = true;
             }
-            WindowEvent::RedrawRequested => {
-                if (renderer.draw_frame(self.start_time) || renderer.framebuffer_resized) {
-                    let size = window.inner_size();
-                    if size.width > 0 && size.height > 0 {
-                        debug!("Recreating swapchain");
-                        renderer.framebuffer_resized = false;
-                        renderer.recreate_swapchain();
-                    } else {
-                        return;
-                    }
-                }
-
-                window.request_redraw();
-            }
             _ => (),
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let window = self.window.as_ref().unwrap();
+        let renderer = self.renderer.as_mut().unwrap();
+
+        let now = std::time::Instant::now();
+        let diff = now - self.last_frame;
+        if renderer.draw_frame(diff.as_secs_f32()) || renderer.framebuffer_resized {
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                debug!("Recreating swapchain");
+                renderer.framebuffer_resized = false;
+                renderer.recreate_swapchain();
+            } else {
+                return;
+            }
+        }
+        self.last_frame = now;
+    }
+}
+
+fn create_ssbos(num: usize) -> Vec<SSBO> {
+    let mut rng = rand::rng();
+
+    (0..num)
+        .map(|_| SSBO {
+            pos: [rng.random_range(-1.0..1.0), rng.random_range(-1.0..1.0)],
+            vel: [rng.random_range(-1.0..1.0), rng.random_range(-1.0..1.0)],
+        })
+        .collect::<Vec<SSBO>>()
 }
 
 fn main() {
@@ -1514,12 +1553,17 @@ fn main() {
         .init();
 
     let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let ssbos = create_ssbos(10_000);
 
     let mut app = App {
         window: None,
         renderer: None,
-        start_time: std::time::Instant::now(),
+        last_frame: std::time::Instant::now(),
+        initial_data: ssbos,
+        draws_per_ssbo: 3,
+        shader_local_size: [1024, 1, 1],
     };
 
     event_loop.run_app(&mut app).unwrap();
